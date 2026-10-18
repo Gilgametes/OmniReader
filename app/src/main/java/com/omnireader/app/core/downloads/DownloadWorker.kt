@@ -49,6 +49,12 @@ class DownloadWorker @AssistedInject constructor(
             return Result.failure()
         }
 
+        // Retry path: the original page URLs may be unavailable offline. If every page
+        // already exists on disk we can complete without touching the network at all.
+        val preDir = chapterDir(applicationContext, chapterUrl)
+        val existingCount = preDir.listFiles()?.count { it.name.startsWith("page_") } ?: 0
+        val resumeOnly = pages.all { !it.startsWith("http") } || existingCount >= pages.size
+
         downloadDao.upsert(
             DownloadEntity(
                 chapterUrl = chapterUrl, mediaUrl = mediaUrl, state = DownloadState.DOWNLOADING,
@@ -70,6 +76,7 @@ class DownloadWorker @AssistedInject constructor(
                             val ext = url.substringAfterLast('.', "jpg").take(4).ifBlank { "jpg" }
                             val out = File(dir, "page_%04d.%s".format(i + 1, ext))
                             val size = if (!out.exists()) {
+                                if (resumeOnly) return@async // offline resume: skip missing page
                                 val data = http.getBytes(url)
                                 withContext(Dispatchers.IO) { out.writeBytes(data) }
                                 data.size.toLong()
@@ -145,6 +152,33 @@ class DownloadWorker @AssistedInject constructor(
                 .build()
             workManager.enqueueUniqueWork(uniqueName(chapterUrl), ExistingWorkPolicy.KEEP, request)
             return request.id
+        }
+
+        /** Re-queue a paused/failed chapter with its original page list. */
+        fun retry(workManager: WorkManager, context: Context, entity: DownloadEntity) {
+            val dir = chapterDir(context, entity.chapterUrl)
+            val pages = dir.listFiles()?.filter { it.name.startsWith("page_") }
+                ?.sortedBy { it.name }?.map { it.name } ?: emptyList()
+            // Prefer the recorded total; pad missing names so worker resumes cleanly.
+            val urls = if (pages.isNotEmpty()) {
+                List(entity.totalPages.coerceAtLeast(pages.size)) { i ->
+                    "local:%s".format(pages.getOrNull(i)?.name ?: "page_%04d".format(i + 1))
+                }
+            } else {
+                List(entity.totalPages) { i -> "page_%04d".format(i + 1) }
+            }
+            val data = workDataOf(
+                KEY_CHAPTER_URL to entity.chapterUrl,
+                KEY_MEDIA_URL to entity.mediaUrl,
+                KEY_TITLE to entity.title,
+                KEY_MEDIA_TITLE to entity.mediaTitle,
+                KEY_PAGES to urls.toTypedArray(),
+            )
+            val request = OneTimeWorkRequestBuilder<DownloadWorker>()
+                .setInputData(data)
+                .addTag(TAG)
+                .build()
+            workManager.enqueueUniqueWork(uniqueName(entity.chapterUrl), ExistingWorkPolicy.REPLACE, request)
         }
 
         /** Cancel an in-flight download (worker flips state to PAUSED). */

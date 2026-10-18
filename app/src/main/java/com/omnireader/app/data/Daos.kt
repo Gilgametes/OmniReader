@@ -110,6 +110,15 @@ interface DownloadDao {
     @Query("SELECT * FROM downloads WHERE mediaUrl = :mediaUrl")
     suspend fun forMedia(mediaUrl: String): List<DownloadEntity>
 
+    /** Live rows for one book (used by Source Details chips + reading offline chapters). */
+    @Query("SELECT * FROM downloads WHERE mediaUrl = :mediaUrl")
+    fun observeForMedia(mediaUrl: String): Flow<List<DownloadEntity>>
+
+    /** Grouped live view of every download belonging to a media item. */
+    @Transaction
+    @Query("SELECT * FROM downloads WHERE mediaUrl = :mediaUrl ORDER BY title")
+    fun observeWithMedia(mediaUrl: String): Flow<List<DownloadWithMedia>>
+
     @Query("SELECT * FROM downloads WHERE chapterUrl = :chapterUrl LIMIT 1")
     suspend fun byChapter(chapterUrl: String): DownloadEntity?
 
@@ -130,6 +139,10 @@ interface DownloadDao {
 
     @Query("DELETE FROM downloads WHERE chapterUrl = :chapterUrl")
     suspend fun deleteByChapter(chapterUrl: String)
+
+    /** Bulk cleanup helper (e.g. "clear completed"). Files must be purged separately. */
+    @Query("DELETE FROM downloads WHERE state = :state")
+    suspend fun deleteByState(state: String)
 
     @Query("DELETE FROM downloads WHERE mediaUrl = :mediaUrl")
     suspend fun deleteByMedia(mediaUrl: String)

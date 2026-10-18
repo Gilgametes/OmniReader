@@ -171,4 +171,8 @@ class ReaderEngine @Inject constructor(
             else -> null // EPUB/TEXT/SOURCE use the document reader instead
         }
     }
+
+    /** Provider for a chapter that was downloaded by DownloadWorker (offline reading). */
+    fun providerForDownloadedChapter(chapterUrl: String): PageProvider =
+        DownloadedChapterPageProvider(context, chapterUrl)
 }

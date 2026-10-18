@@ -4,9 +4,11 @@ import android.app.Application
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.omnireader.app.core.downloads.DownloadWorker
+import com.omnireader.app.core.source.Tokens
 import com.omnireader.app.data.MediaDao
 import com.omnireader.app.data.MediaType
+import com.omnireader.app.data.ReadingPosition
+import com.omnireader.app.data.ReadingPositionDao
 import com.omnireader.app.core.reader.PageProvider
 import com.omnireader.app.core.reader.ReaderEngine
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -31,19 +33,26 @@ data class ReaderUiState(
 )
 
 /**
- * Image-sequence reader for CBZ/ZIP folders/PDF pages. Position persists into
- * [com.omnireader.app.data.ReadingPosition] via the mediaId (spineIndex slot).
+ * Image-sequence reader for CBZ/ZIP folders/PDF pages AND offline-downloaded chapters.
+ *
+ * When the route carries a `chapter` token (Base64-URL of the chapter URL coming from
+ * [com.omnireader.app.core.downloads.DownloadWorker]) we open a
+ * [com.omnireader.app.core.reader.DownloadedChapterPageProvider] instead of the SAF item —
+ * that is how "read this downloaded chapter" works from the Download Manager and Source
+ * Details screens. Position persists per mediaId+chapter so each chapter remembers its page.
  */
 @HiltViewModel
 class ReaderViewModel @Inject constructor(
     application: Application,
     private val mediaDao: MediaDao,
     private val engine: ReaderEngine,
-    private val positionDao: com.omnireader.app.data.ReadingPositionDao,
+    private val positionDao: ReadingPositionDao,
     savedStateHandle: SavedStateHandle,
 ) : ViewModel() {
 
     private val mediaId: Long = savedStateHandle.get<Long>("mediaId") ?: -1L
+    private val chapterUrl: String? = savedStateHandle.get<String>("chapter")
+        ?.takeIf { it.isNotBlank() }?.let { Tokens.decode(it) }
     private var provider: PageProvider? = null
 
     private val _state = MutableStateFlow(ReaderUiState())
@@ -58,10 +67,17 @@ class ReaderViewModel @Inject constructor(
             return@launch
         }
         try {
-            val p = engine.providerFor(item.type, item.uri)
-                ?: throw IllegalStateException("Unsupported format: ${item.type}")
+            val p = when {
+                chapterUrl != null -> engine.providerForDownloadedChapter(chapterUrl)
+                else -> engine.providerFor(item.type, item.uri)
+                    ?: throw IllegalStateException("Unsupported format: ${item.type}")
+            }
             provider = p
             val count = withContext(Dispatchers.IO) { p.pageCount() }
+            if (count == 0) {
+                _state.value = _state.value.copy(loading = false, error = "This chapter has no pages yet")
+                return@launch
+            }
             val saved = positionDao.get(mediaId)?.spineIndex ?: 0
             _state.value = _state.value.copy(
                 loading = false,
@@ -107,7 +123,7 @@ class ReaderViewModel @Inject constructor(
 
     private fun persist(page: Int) = viewModelScope.launch {
         positionDao.save(
-            com.omnireader.app.data.ReadingPosition(
+            ReadingPosition(
                 mediaId = mediaId,
                 spineIndex = page,
                 pageIndex = 0,
