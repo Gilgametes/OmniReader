@@ -81,6 +81,9 @@ interface SourceDao {
     @Query("SELECT * FROM sources WHERE repoUrl = :repoUrl AND sourceId = :sourceId LIMIT 1")
     suspend fun one(repoUrl: String, sourceId: String): SourceEntity?
 
+    @Query("SELECT * FROM sources")
+    suspend fun allOnce(): List<SourceEntity>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(source: SourceEntity)
 

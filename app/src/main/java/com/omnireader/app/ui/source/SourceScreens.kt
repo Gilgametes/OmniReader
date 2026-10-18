@@ -221,7 +221,13 @@ class SourceDetailsViewModel @Inject constructor(
 ) : ViewModel() {
 
     private val detailsUrl: String = Tokens.decode(savedStateHandle.get<String>("detailsToken") ?: "")
-    private val passedTitle: String = Tokens.decode(savedStateHandle.get<String>("titleToken") ?: "")
+
+    /** Title, or a "repo\u0000sourceId" hint packed by the Catalog screen's remote route. */
+    private val passedTitleRaw: String = Tokens.decode(savedStateHandle.get<String>("titleToken") ?: "")
+    private val titleHint: Pair<String, String>? = passedTitleRaw.split('\u0000', limit = 2)
+        .takeIf { it.size == 2 && it[0].isNotBlank() && it[1].isNotBlank() }
+        ?.let { it[0] to it[1] }
+    private val passedTitle: String get() = if (titleHint != null) "" else passedTitleRaw
 
     /** Key of the local library row mirroring this remote entry (its URL is used as mediaUrl). */
     private val mediaUrlKey: String get() = detailsUrl
@@ -258,8 +264,18 @@ class SourceDetailsViewModel @Inject constructor(
         }
     }
 
-    private suspend fun findSourceFor(url: String): com.omnireader.app.data.SourceEntity? =
-        sourceDao.enabledOnce().firstOrNull { url.startsWith(it.baseUrl) }
+    private suspend fun findSourceFor(url: String): com.omnireader.app.data.SourceEntity? {
+        // Exact repo+source hint (packed by the Catalog's remote route) wins.
+        titleHint?.let { (repo, sourceId) ->
+            sourceDao.one(repo, sourceId)?.let { return it }
+        }
+        val enabled = sourceDao.enabledOnce()
+        enabled.firstOrNull { url.startsWith(it.baseUrl) }?.let { return it }
+        // Fall back to disabled sources too — deep links from downloads may point
+        // at a source the user later switched off.
+        return runCatching { sourceDao.allOnce() }.getOrNull()
+            ?.firstOrNull { url.startsWith(it.baseUrl) }
+    }
 
     fun queueChapterDownload(chapter: ChapterRow) = viewModelScope.launch {
         val srcEntity = findSourceFor(chapter.url) ?: return@launch

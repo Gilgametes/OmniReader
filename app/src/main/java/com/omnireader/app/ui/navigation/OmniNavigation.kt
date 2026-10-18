@@ -153,8 +153,10 @@ fun OmniNavigation(navController: NavHostController = rememberNavController()) {
                             else -> navController.navigate(Routes.image(id))
                         }
                     },
-                    onOpenRemote = { detailsUrl, title ->
-                        navController.navigate(Routes.sourceDetails(detailsUrl, title))
+                    onOpenRemote = { repo, sourceId, urlToken ->
+                        navController.navigate(
+                            "source/details/$urlToken/${Tokens.encode("$repo\u0000$sourceId")}"
+                        )
                     },
                 )
             }
