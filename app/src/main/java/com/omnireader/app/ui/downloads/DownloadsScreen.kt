@@ -10,8 +10,10 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
@@ -27,6 +29,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -53,6 +56,7 @@ import androidx.compose.runtime.State
 @HiltViewModel
 class DownloadsViewModel @Inject constructor(
     private val downloadDao: DownloadDao,
+    private val mediaDao: com.omnireader.app.data.MediaDao,
     private val workManager: WorkManager,
     @dagger.hilt.android.qualifiers.ApplicationContext private val appContext: android.content.Context,
 ) : ViewModel() {
@@ -64,6 +68,20 @@ class DownloadsViewModel @Inject constructor(
     val history: StateFlow<List<DownloadEntity>> = downloadDao.observeAll()
         .map { list -> list.filter { it.state != DownloadState.DOWNLOADING && it.state != DownloadState.QUEUED } }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Ensure the remote book has a library row (so the reader can resolve its cover/title), return its id. */
+    suspend fun ensureMediaRow(entity: DownloadEntity): Long? {
+        mediaDao.byUri(entity.mediaUrl)?.let { return it.id }
+        mediaDao.insert(
+            com.omnireader.app.data.MediaItem(
+                title = entity.mediaTitle.ifBlank { "Untitled" },
+                type = com.omnireader.app.data.MediaType.SOURCE,
+                uri = entity.mediaUrl,
+                sourceUrl = entity.mediaUrl,
+            )
+        )
+        return mediaDao.byUri(entity.mediaUrl)?.id
+    }
 
     fun cancel(entity: DownloadEntity) {
         DownloadWorker.cancel(workManager, entity.chapterUrl)
@@ -87,12 +105,14 @@ class DownloadsViewModel @Inject constructor(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DownloadsScreen(
+    onOpenChapter: (mediaId: Long, chapterUrl: String) -> Unit,
     modifier: Modifier = Modifier,
     vm: DownloadsViewModel = hiltViewModel(),
 ) {
     val active by vm.active.collectAsStateWithLifecycle()
     val history by vm.history.collectAsStateWithLifecycle()
     var showHistory by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
 
     Scaffold(
         modifier = modifier,
@@ -164,9 +184,22 @@ fun DownloadsScreen(
                             },
                             trailingContent = {
                                 Row(horizontalArrangement = Arrangement.spacedBy(0.dp)) {
+                                    if (e.state == DownloadState.COMPLETE) {
+                                        IconButton(onClick = {
+                                            scope.launch {
+                                                val mediaId = vm.ensureMediaRow(e)
+                                                if (mediaId != null) onOpenChapter(mediaId, e.chapterUrl)
+                                            }
+                                        }) {
+                                            Icon(
+                                                Icons.AutoMirrored.Filled.ArrowForward,
+                                                contentDescription = "Read offline",
+                                            )
+                                        }
+                                    }
                                     if (e.state == DownloadState.ERROR || e.state == DownloadState.PAUSED) {
                                         IconButton(onClick = { vm.retry(e) }) {
-                                            Icon(Icons.Default.Close, contentDescription = "Retry")
+                                            Icon(Icons.Default.Refresh, contentDescription = "Retry")
                                         }
                                     }
                                     IconButton(onClick = { vm.delete(e) }) {

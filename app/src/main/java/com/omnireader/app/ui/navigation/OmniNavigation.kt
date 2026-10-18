@@ -165,14 +165,8 @@ fun OmniNavigation(navController: NavHostController = rememberNavController()) {
             }
             composable(Routes.DOWNLOADS) {
                 DownloadsScreen(
-                    onOpenChapter = { mediaId, chapterDir ->
-                        navController.navigate(Routes.image(mediaId, chapterDir))
-                    },
-                    onOpenMedia = { mediaId, type ->
-                        when (type) {
-                            MediaType.EPUB -> navController.navigate(Routes.epub(mediaId))
-                            else -> navController.navigate(Routes.image(mediaId))
-                        }
+                    onOpenChapter = { mediaId, chapterUrl ->
+                        navController.navigate(Routes.image(mediaId, chapterUrl))
                     },
                 )
             }

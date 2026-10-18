@@ -29,7 +29,9 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -298,6 +300,15 @@ class SourceDetailsViewModel @Inject constructor(
         )
     }
 
+    /** Resolve the local library row for this remote entry and open the given chapter offline. */
+    suspend fun localMediaIdForOffline(): Long? = mediaDao.byUri(mediaUrlKey)?.id
+
+    /** Import on demand and return the new row id (insert returns -1 on conflict, so re-query). */
+    suspend fun importToLibraryAndResolveId(): Long? {
+        importToLibrary()
+        return mediaDao.byUri(mediaUrlKey)?.id
+    }
+
 }
 
 /** Details screen with per-chapter inline download status chips. */
@@ -305,7 +316,7 @@ class SourceDetailsViewModel @Inject constructor(
 @Composable
 fun SourceDetailsScreen(
     onBack: () -> Unit,
-    onOpenReaderFromDownloads: (mediaUrl: String) -> Unit,
+    onOpenReaderFromDownloads: (mediaId: Long, chapterUrl: String) -> Unit,
     modifier: Modifier = Modifier,
     vm: SourceDetailsViewModel = hiltViewModel(),
 ) {
@@ -313,6 +324,7 @@ fun SourceDetailsScreen(
     val loading by vm.loading.collectAsStateWithLifecycle()
     val error by vm.error.collectAsStateWithLifecycle()
     val dlMap by vm.downloads.collectAsStateWithLifecycle()
+    val scope = rememberCoroutineScope()
 
     Scaffold(
         modifier = modifier,
@@ -345,6 +357,13 @@ fun SourceDetailsScreen(
                             onStart = { vm.queueChapterDownload(ch) },
                             onCancel = { vm.cancelDownload(ch.url) },
                             onDelete = { vm.deleteDownload(ch.url) },
+                            onReadOffline = {
+                                scope.launch {
+                                    val mediaId = vm.localMediaIdForOffline()
+                                        ?: vm.importToLibraryAndResolveId()
+                                    if (mediaId != null) onOpenReaderFromDownloads(mediaId, ch.url)
+                                }
+                            },
                         )
                     }
                 }
@@ -353,7 +372,7 @@ fun SourceDetailsScreen(
     }
 }
 
-/** Compact chip: idle → ⬇, queued/downloading → live progress, error → retry, complete → ✓/delete. */
+/** Compact chip: idle → ⬇, queued/downloading → live progress, error → retry, complete → read/delete. */
 @Composable
 fun InlineDownloadChip(
     state: String?,
@@ -362,6 +381,7 @@ fun InlineDownloadChip(
     onStart: () -> Unit,
     onCancel: () -> Unit,
     onDelete: () -> Unit,
+    onReadOffline: () -> Unit = {},
 ) {
     when (state) {
         null, DownloadState.PAUSED -> IconButton(onClick = onStart) {
@@ -377,10 +397,17 @@ fun InlineDownloadChip(
         }
         DownloadState.ERROR -> FilterChip(selected = true, onClick = onStart,
             label = { Text("Retry") }, trailingIcon = {
-                Icon(Icons.Default.Download, null, modifier = Modifier.clickable(onClick = onDelete))
+                Icon(Icons.Default.Delete, null, modifier = Modifier.clickable(onClick = onDelete))
             })
-        DownloadState.COMPLETE -> FilterChip(selected = true, onClick = onDelete,
-            label = { Text("✓ $total") })
+        DownloadState.COMPLETE -> Row(verticalAlignment = Alignment.CenterVertically) {
+            FilterChip(selected = true, onClick = onReadOffline,
+                label = { Text("Read") }, leadingIcon = {
+                    Icon(Icons.AutoMirrored.Filled.ArrowForward, null)
+                })
+            IconButton(onClick = onDelete) {
+                Icon(Icons.Default.Delete, contentDescription = "Delete download")
+            }
+        }
         else -> {}
     }
 }
