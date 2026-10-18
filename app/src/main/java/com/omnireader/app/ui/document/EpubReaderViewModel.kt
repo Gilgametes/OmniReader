@@ -1,25 +1,26 @@
 package com.omnireader.app.ui.document
 
+import android.content.Context
+import android.net.Uri
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import android.content.Context
 import com.omnireader.app.core.epub.EpubArchive
 import com.omnireader.app.core.epub.EpubBook
-import com.omnireader.app.core.epub.EpubTocEntry
 import com.omnireader.app.data.Bookmark
 import com.omnireader.app.data.BookmarkDao
 import com.omnireader.app.data.MediaDao
 import com.omnireader.app.data.ReadingPosition
 import com.omnireader.app.data.ReadingPositionDao
+import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
+import javax.inject.Inject
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-import javax.inject.Inject
 
 data class EpubUiState(
     val loading: Boolean = true,
@@ -34,6 +35,7 @@ data class EpubUiState(
     val lineHeight: Float = 1.5f,
     val theme: ReadTheme = ReadTheme.AUTO,
 ) {
+    /** Coarse "book progress" — chapter fraction + page-within-chapter fraction. */
     val progressPercent: Int
         get() {
             val b = book ?: return 0
@@ -42,15 +44,19 @@ data class EpubUiState(
             val within = if (chapterPageCount > 0) pageIndex.toFloat() / chapterPageCount else 0f
             return ((spineIndex + within) * perChapter).toInt().coerceIn(0, 100)
         }
+
+    /** Bump whenever the WebView must reload a fresh chapter document. */
+    val chapterToken: Long get() = spineIndex * 1_000_003L + (if (paginated) 1 else 2)
 }
 
 enum class ReadTheme { LIGHT, DARK, SEPIA, AUTO }
 
 /**
- * Drives the EPUB reading experience: pagination state, position persistence,
- * TOC and bookmarks. All positions are saved to Room on every change (debounced
- * by the fact that page turns are user-paced).
+ * Drives the production EPUB experience: swipeable in-chapter pages, position
+ * restoration (page or raw scroll offset), nested TOC and bookmarks. All positions
+ * persist to Room on every user-paced change.
  */
+@HiltViewModel
 class EpubReaderViewModel @Inject constructor(
     @ApplicationContext private val context: Context,
     private val mediaDao: MediaDao,
@@ -59,7 +65,6 @@ class EpubReaderViewModel @Inject constructor(
     savedStateHandle: SavedStateHandle,
 ) : ViewModel() {
 
-    // mediaId arrives as a nav argument; token style keeps parity with URL routes.
     private val mediaId: Long = savedStateHandle.get<Long>("mediaId") ?: -1L
 
     private val _state = MutableStateFlow(EpubUiState())
@@ -77,7 +82,7 @@ class EpubReaderViewModel @Inject constructor(
             return@launch
         }
         try {
-            val uri = android.net.Uri.parse(item.uri)
+            val uri = Uri.parse(item.uri)
             val book = EpubArchive.read(uri, context.contentResolver)
             val saved = positionDao.get(mediaId)
             _state.value = _state.value.copy(
@@ -94,9 +99,11 @@ class EpubReaderViewModel @Inject constructor(
         }
     }
 
-    /** Called by the WebView bridge once JS pagination finished for the current chapter. */
+    // ---- Pagination callbacks from the WebView bridge ----------------------
+
+    /** Called by JS once pagination finished for the current chapter. */
     fun onChapterPaginated(totalPages: Int) {
-        _state.update {
+        update {
             it.copy(
                 chapterPageCount = totalPages.coerceAtLeast(1),
                 pageIndex = it.pageIndex.coerceIn(0, totalPages - 1),
@@ -106,39 +113,62 @@ class EpubReaderViewModel @Inject constructor(
     }
 
     fun onPageChange(index: Int) {
-        _state.update { it.copy(pageIndex = index.coerceIn(0, (it.chapterPageCount - 1).coerceAtLeast(0))) }
+        update { it.copy(pageIndex = index.coerceIn(0, (it.chapterPageCount - 1).coerceAtLeast(0))) }
         persist()
     }
 
-    fun nextPage() = _state.update { it.copy(pageIndex = (it.pageIndex + 1)) }
-    fun prevPage() = _state.update { it.copy(pageIndex = (it.pageIndex - 1).coerceAtLeast(0)) }
+    fun onScroll(y: Int) {
+        update { it.copy(scrollY = y) }
+        persist()
+    }
+
+    // ---- Navigation ---------------------------------------------------------
+
+    fun goToSpine(index: Int, page: Int = 0) {
+        update { s ->
+            val b = s.book ?: return@update s
+            val clamped = index.coerceIn(0, (b.spine.size - 1).coerceAtLeast(0))
+            s.copy(spineIndex = clamped, pageIndex = page, chapterPageCount = 1, scrollY = 0)
+        }
+        persist()
+    }
 
     fun nextChapter() = goToSpine(_state.value.spineIndex + 1)
     fun prevChapter() = goToSpine(_state.value.spineIndex - 1)
 
-    fun goToSpine(index: Int, page: Int = 0) = _state.update { s ->
-        val b = s.book ?: return@update s
-        val clamped = index.coerceIn(0, (b.spine.size - 1).coerceAtLeast(0))
-        s.copy(spineIndex = clamped, pageIndex = page, chapterPageCount = 1)
-    }.also { persist() }
-
-    fun onScroll(y: Int) {
-        _state.update { it.copy(scrollY = y) }
-        persist()
+    /** Horizontal swipe at chapter edges crosses into the neighbouring chapter. */
+    fun swipeForward() {
+        val s = _state.value
+        when {
+            !s.paginated -> nextChapter()
+            s.pageIndex < s.chapterPageCount - 1 -> onPageChange(s.pageIndex + 1)
+            else -> goToSpine(s.spineIndex + 1, page = 0)
+        }
     }
+
+    fun swipeBackward() {
+        val s = _state.value
+        when {
+            !s.paginated -> prevChapter()
+            s.pageIndex > 0 -> onPageChange(s.pageIndex - 1)
+            else -> goToSpine(s.spineIndex - 1, page = Int.MAX_VALUE) // land on last page after repagination
+        }
+    }
+
+    // ---- Settings -----------------------------------------------------------
 
     fun setPaginated(value: Boolean) {
-        _state.update { it.copy(paginated = value) }
+        update { it.copy(paginated = value) }
         persist()
     }
 
-    fun setFontSize(px: Int) { _state.update { it.copy(fontSizePx = px.coerceIn(12, 40)) } }
-    fun setLineHeight(v: Float) { _state.update { it.copy(lineHeight = v.coerceIn(1.1f, 2.2f)) } }
-    fun setTheme(t: ReadTheme) { _state.update { it.copy(theme = t) } }
+    fun setFontSize(px: Int) = update { it.copy(fontSizePx = px.coerceIn(12, 40)) }
+    fun setLineHeight(v: Float) = update { it.copy(lineHeight = v.coerceIn(1.1f, 2.2f)) }
+    fun setTheme(t: ReadTheme) = update { it.copy(theme = t) }
 
     // ---- Bookmarks ----------------------------------------------------------
 
-    fun toggleBookmarkAtCurrentPage(labelHint: String) = viewModelScope.launch {
+    fun toggleBookmarkAtCurrentPage(labelHint: String = "") = viewModelScope.launch {
         val s = _state.value
         if (bookmarkDao.existsAt(mediaId, s.spineIndex, s.pageIndex)) {
             bookmarkDao.removeAt(mediaId, s.spineIndex, s.pageIndex)
@@ -157,11 +187,14 @@ class EpubReaderViewModel @Inject constructor(
         }
     }
 
+    suspend fun isBookmarked(spineIndex: Int, pageIndex: Int): Boolean =
+        bookmarkDao.existsAt(mediaId, spineIndex, pageIndex)
+
     fun jumpTo(bookmark: Bookmark) = goToSpine(bookmark.spineIndex, bookmark.pageIndex)
 
     fun deleteBookmark(bookmark: Bookmark) = viewModelScope.launch { bookmarkDao.delete(bookmark) }
 
-    // ---- Position persistence ----------------------------------------------
+    // ---- Persistence --------------------------------------------------------
 
     private fun persist() = viewModelScope.launch {
         val s = _state.value
@@ -175,5 +208,7 @@ class EpubReaderViewModel @Inject constructor(
         )
     }
 
-    private inline fun <T> MutableStateFlow<T>.update(block: (T) -> T) { value = block(value) }
+    private inline fun update(block: (EpubUiState) -> EpubUiState) {
+        _state.value = block(_state.value)
+    }
 }

@@ -3,7 +3,11 @@ package com.omnireader.app.core.downloads
 import android.content.Context
 import androidx.hilt.work.HiltWorker
 import androidx.work.CoroutineWorker
+import androidx.work.ExistingWorkPolicy
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkManager
 import androidx.work.WorkerParameters
+import androidx.work.workDataOf
 import com.omnireader.app.core.HttpFetcher
 import com.omnireader.app.data.DownloadDao
 import com.omnireader.app.data.DownloadEntity
@@ -11,11 +15,20 @@ import com.omnireader.app.data.DownloadState
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedInject
 import java.io.File
+import java.util.UUID
+import java.util.concurrent.Executors
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withContext
 
 /**
  * Downloads every page image of a chapter into filesDir/downloads/<hash>/page_NNNN.<ext>.
  * Updates DownloadEntity progress/state as it goes so the global Download Manager UI
- * (and the inline Source Details chips) can render live status.
+ * (and the inline Source Details chips) can render live status. Pages are fetched with a
+ * small bounded parallel pool for a big speed-up on long chapters.
  */
 @HiltWorker
 class DownloadWorker @AssistedInject constructor(
@@ -30,7 +43,6 @@ class DownloadWorker @AssistedInject constructor(
         val mediaUrl = inputData.getString(KEY_MEDIA_URL) ?: return Result.failure()
         val title = inputData.getString(KEY_TITLE) ?: ""
         val mediaTitle = inputData.getString(KEY_MEDIA_TITLE) ?: ""
-        @Suppress("UNCHECKED_CAST")
         val pages = inputData.getStringArray(KEY_PAGES)?.toList() ?: emptyList()
         if (pages.isEmpty()) {
             downloadDao.setError(chapterUrl, "No pages found")
@@ -45,27 +57,45 @@ class DownloadWorker @AssistedInject constructor(
         )
 
         val dir = chapterDir(applicationContext, chapterUrl).apply { mkdirs() }
+        // Guard shared counters / DB row writes from parallel page jobs.
+        val lock = Any()
         var bytes = 0L
+        var done = 0
         try {
-            pages.forEachIndexed { i, url ->
-                if (isStopped) {
-                    downloadDao.setState(chapterUrl, DownloadState.PAUSED)
-                    return Result.success()
+            coroutineScope {
+                Executors.newFixedThreadPool(PARALLELISM).asCoroutineDispatcher().use { dispatcher ->
+                    pages.mapIndexed { i, url ->
+                        async(dispatcher) {
+                            if (isStopped) return@async
+                            val ext = url.substringAfterLast('.', "jpg").take(4).ifBlank { "jpg" }
+                            val out = File(dir, "page_%04d.%s".format(i + 1, ext))
+                            val size = if (!out.exists()) {
+                                val data = http.getBytes(url)
+                                withContext(Dispatchers.IO) { out.writeBytes(data) }
+                                data.size.toLong()
+                            } else {
+                                out.length()
+                            }
+                            synchronized(lock) {
+                                bytes += size
+                                done++
+                                downloadDao.setProgress(chapterUrl, done, pages.size, bytes)
+                            }
+                        }
+                    }.awaitAll()
                 }
-                val ext = url.substringAfterLast('.', "jpg").take(4).ifBlank { "jpg" }
-                val out = File(dir, "page_%04d.%s".format(i + 1, ext))
-                if (!out.exists()) {
-                    val data = http.getBytes(url)
-                    out.writeBytes(data)
-                    bytes += data.size
-                } else {
-                    bytes += out.length()
-                }
-                downloadDao.setProgress(chapterUrl, i + 1, pages.size, bytes)
+            }
+            if (isStopped) {
+                downloadDao.setState(chapterUrl, DownloadState.PAUSED)
+                return Result.success()
             }
             downloadDao.setState(chapterUrl, DownloadState.COMPLETE)
             return Result.success()
         } catch (t: Throwable) {
+            if (isStopped) {
+                downloadDao.setState(chapterUrl, DownloadState.PAUSED)
+                return Result.success()
+            }
             if (runAttemptCount < MAX_RETRIES) return Result.retry()
             downloadDao.setError(chapterUrl, t.message ?: "Download failed")
             return Result.failure()
@@ -78,15 +108,49 @@ class DownloadWorker @AssistedInject constructor(
         const val KEY_TITLE = "title"
         const val KEY_MEDIA_TITLE = "mediaTitle"
         const val KEY_PAGES = "pages"
+        const val TAG = "omni_download"
         private const val MAX_RETRIES = 2
+        private const val PARALLELISM = 4
 
         fun chapterDir(context: Context, chapterUrl: String): File =
             File(context.filesDir, "downloads/${chapterUrl.hashCode().toUInt()}")
 
         /** Delete downloaded files for a chapter and forget the row. */
         suspend fun purge(context: Context, dao: DownloadDao, entity: DownloadEntity) {
-            runCatching { chapterDir(context, entity.chapterUrl).deleteRecursively() }
+            runCatching {
+                withContext(Dispatchers.IO) { chapterDir(context, entity.chapterUrl).deleteRecursively() }
+            }
             dao.deleteByChapter(entity.chapterUrl)
         }
+
+        /** Queue a chapter download; idempotent per chapter (KEEP policy). */
+        fun enqueue(
+            workManager: WorkManager,
+            chapterUrl: String,
+            mediaUrl: String,
+            title: String,
+            mediaTitle: String,
+            pages: List<String>,
+        ): UUID {
+            val data = workDataOf(
+                KEY_CHAPTER_URL to chapterUrl,
+                KEY_MEDIA_URL to mediaUrl,
+                KEY_TITLE to title,
+                KEY_MEDIA_TITLE to mediaTitle,
+                KEY_PAGES to pages.toTypedArray(),
+            )
+            val request = OneTimeWorkRequestBuilder<DownloadWorker>()
+                .setInputData(data)
+                .addTag(TAG)
+                .build()
+            workManager.enqueueUniqueWork(uniqueName(chapterUrl), ExistingWorkPolicy.KEEP, request)
+            return request.id
+        }
+
+        /** Cancel an in-flight download (worker flips state to PAUSED). */
+        fun cancel(workManager: WorkManager, chapterUrl: String) =
+            workManager.cancelUniqueWork(uniqueName(chapterUrl))
+
+        fun uniqueName(chapterUrl: String): String = "dl_${chapterUrl.hashCode().toUInt()}"
     }
 }

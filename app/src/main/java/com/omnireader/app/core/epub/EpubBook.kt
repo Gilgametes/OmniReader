@@ -26,7 +26,8 @@ data class EpubTocEntry(
 class EpubBook internal constructor(
     val title: String,
     val author: String,
-    val coverBytes: ByteArray?,
+    /** Exposed for library cover extraction. */
+    val cover: ByteArray?,
     /** (x)html resources in reading order; each entry is the raw bytes provider by href */
     val spine: List<String>,
     val toc: List<EpubTocEntry>,
@@ -109,7 +110,7 @@ object EpubArchive {
         EpubBook(
             title = title,
             author = author,
-            coverBytes = coverHref?.let { resources[it] },
+            cover = coverHref?.let { resources[it] },
             spine = spine,
             toc = toc,
             resources = resources,
@@ -133,11 +134,11 @@ object EpubArchive {
         val navItem = manifest.values.firstOrNull { it.third.contains("nav") }
         if (navItem != null) resources[navItem.first]?.let { bytes ->
             val toc = parseNavXhtml(String(bytes), navItem.first, opfDir, spine)
-            if (toc.isNotEmpty()) return toc
+            if (toc.isNotEmpty()) return flatten(toc)
         }
         val ncxItem = manifest.values.firstOrNull { it.second == "application/x-dtbncx+xml" }
         if (ncxItem != null) resources[ncxItem.first]?.let { bytes ->
-            return parseNcx(String(bytes), ncxItem.first, spine)
+            return flatten(parseNcx(String(bytes), ncxItem.first, spine))
         }
         // Fallback: one TOC entry per spine item.
         return spine.mapIndexed { i, href ->
@@ -145,16 +146,18 @@ object EpubArchive {
         }
     }
 
+    /** Depth-first flattening so UI lists can render with indentation from [EpubTocEntry.level]. */
+    private fun flatten(entries: List<EpubTocEntry>): List<EpubTocEntry> =
+        entries.flatMap { listOf(it.copy(children = emptyList())) + flatten(it.children) }
+
     private fun parseNavXhtml(html: String, navHref: String, opfDir: String, spine: List<String>): List<EpubTocEntry> {
         val doc = Jsoup.parse(html)
-        val navEl = doc.selectFirst("nav[$epub-type-props]")
+        val navEl = doc.selectFirst("nav[type~=toc]")
             ?: doc.body().select("nav").firstOrNull()
             ?: doc.body()
         val root = navEl.selectFirst("ol") ?: return emptyList()
         return parseOl(root, navHref, opfDir, spine, 0)
     }
-
-    private const val epubTypeProps = "epub|type~='toc'"
 
     private fun parseOl(
         ol: org.jsoup.nodes.Element,
